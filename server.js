@@ -121,19 +121,36 @@ _Registrado en GataCredito_`;
     }
 });
 
+// Eliminar un préstamo específico en PostgreSQL por ID
+app.delete('/api/loans/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await pool.query('DELETE FROM loans WHERE id = $1', [id]);
+        res.json({ success: true, message: 'Préstamo eliminado de PostgreSQL' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al eliminar el préstamo en la base de datos' });
+    }
+});
+
 // TAREA AUTOMÁTICA DIARIA: Alerta de cobros a las 8:00 AM (Hora Colombia)
 cron.schedule('0 8 * * *', async () => {
     try {
         const result = await pool.query('SELECT data FROM loans');
         const loans = result.rows.map(r => r.data);
         
-        const todayStr = new Date().toISOString().split('T')[0];
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Bogota' });
         let cobrosHoy = [];
         let atrasados = [];
 
         loans.forEach(loan => {
-            const paid = loan.payments.reduce((sum, p) => sum + p.amount, 0);
-            if (paid >= loan.totalPayable - 0.01) return; // Préstamo ya cancelado
+            const payments = Array.isArray(loan.payments) ? loan.payments : [];
+            const debtPaid = payments.reduce((sum, p) => {
+                const isIntOnly = p && (p.isInterestOnly === true || p.type === 'Abono Interés de Cuota');
+                return sum + (isIntOnly ? 0 : (p.amount || 0));
+            }, 0);
+
+            if (debtPaid >= loan.totalPayable - 0.01) return; // Préstamo ya cancelado
 
             const nextDueDate = calculateNextDueDateForCron(loan);
             if (nextDueDate === todayStr) {
@@ -171,19 +188,31 @@ cron.schedule('0 8 * * *', async () => {
 });
 
 function calculateNextDueDateForCron(loan) {
-    const paidCount = loan.payments.length;
+    const payments = Array.isArray(loan.payments) ? loan.payments : [];
+    const advances = payments.reduce((sum, p) => {
+        if (typeof p.advancesAdded === 'number') return sum + p.advancesAdded;
+        const isIntOnly = p && (p.isInterestOnly === true || p.type === 'Abono Interés de Cuota');
+        return sum + (isIntOnly ? 0 : 1);
+    }, 0);
+
+    const extensions = payments.reduce((sum, p) => {
+        if (typeof p.extensionsAdded === 'number') return sum + p.extensionsAdded;
+        const isIntOnly = p && (p.isInterestOnly === true || p.type === 'Abono Interés de Cuota');
+        return sum + (isIntOnly ? 1 : 0);
+    }, 0);
+
     const start = new Date(loan.startDate + 'T00:00:00');
-    let daysToAdd = 0;
-    const mult = paidCount + 1;
+    let daysPerStep = 7;
 
     switch(loan.frequency) {
-        case 'diario': daysToAdd = 1 * mult; break;
-        case 'semanal': daysToAdd = 7 * mult; break;
-        case 'quincenal': daysToAdd = 15 * mult; break;
-        case 'mensual': daysToAdd = 30 * mult; break;
+        case 'diario': daysPerStep = 1; break;
+        case 'semanal': daysPerStep = 7; break;
+        case 'quincenal': daysPerStep = 15; break;
+        case 'mensual': daysPerStep = 30; break;
     }
 
-    start.setDate(start.getDate() + daysToAdd);
+    const totalPeriods = advances + 1 + extensions;
+    start.setDate(start.getDate() + (daysPerStep * totalPeriods));
     return start.toISOString().split('T')[0];
 }
 
